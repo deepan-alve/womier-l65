@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.pyc
+
+# ghidra project db (re-importable from firmware/l65-full.bin) and big toolchains
+work/
+ghidra_*/
+jdk-*/
+*.rep/
+*.gpr
+*.lock
+
+# vendor binaries (proprietary — keep local, not in repo)
+*.exe
+OemDrv*
+Womier_L65*
+
+# scratch
+*.log
+*.tmp
+backup-*/
