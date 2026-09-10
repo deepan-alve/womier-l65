@@ -1,0 +1,19 @@
+# Womier L65 knob daemon — systemd user service.
+# Install:
+#   install -Dm755 linux/knobd.py ~/.local/bin/knobd.py
+#   mkdir -p ~/.config/systemd/user && cp systemd/knobd.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now knobd.service
+# You must be in the 'input' group (see docs/GUIDE.md section 2).
+
+[Unit]
+Description=Womier L65 knob daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/knobd.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

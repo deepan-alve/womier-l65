@@ -8,6 +8,9 @@ userspace **knob daemon** that turns the volume knob into a context-aware media 
 > Personal project on my own hardware. Private repo — the `firmware/` dumps and the
 > decompiled reference under `re/` are from my own device for my own use.
 
+📖 **Full step-by-step instructions: [docs/GUIDE.md](docs/GUIDE.md)** — setup, permissions, knob daemon,
+lighting/remap, firmware flashing, factory reset, troubleshooting.
+
 ## Layout
 
 | Path | What |
@@ -17,6 +20,9 @@ userspace **knob daemon** that turns the volume knob into a context-aware media 
 | `windows/l65w.ps1`| Windows wireless control tool (PowerShell). |
 | `firmware/`       | Firmware dumps + patched builds. See `firmware/README.md`. |
 | `tools/`          | `sinowisp` flasher (Linux + Windows builds) for the SH68F90 ISP. |
+| `udev/`           | hidraw udev rule so `l65ctl.py` runs without sudo. |
+| `systemd/`        | user service to autostart the knob daemon. |
+| `docs/GUIDE.md`   | **Full Linux instructions** (start here). |
 | `docs/L65-protocol.md` | HID/RF protocol reference. |
 | `re/`             | Reverse-engineering artifacts: Ghidra export scripts, decompiled firmware C, decompiled `sinowisp` Rust. |
 

@@ -1,0 +1,10 @@
+# Womier L65 — hidraw access for l65ctl.py without sudo.
+# Install:
+#   sudo cp udev/60-womier-l65.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then re-plug the keyboard / dongle.
+
+# wired keyboard (SinoWealth SH68F90)
+KERNEL=="hidraw*", ATTRS{idVendor}=="258a", ATTRS{idProduct}=="010c", MODE="0660", TAG+="uaccess"
+# 2.4GHz dongle (Beken BK3632 "Compx" receiver)
+KERNEL=="hidraw*", ATTRS{idVendor}=="3554", ATTRS{idProduct}=="fa09", MODE="0660", TAG+="uaccess"
