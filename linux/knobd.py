@@ -65,6 +65,11 @@ ROTATE_UP    = {ecodes.KEY_VOLUMEUP, ecodes.KEY_BRIGHTNESSUP}
 ROTATE_DOWN  = {ecodes.KEY_VOLUMEDOWN, ecodes.KEY_BRIGHTNESSDOWN}
 PRESS_CODE   = ecodes.KEY_MUTE     # knob press; confirm via --dry-run, change if different
 
+RESCAN_EVERY = 3.0                # s between device re-scans. The keyboard's
+                                  # event nodes are renumbered on every replug
+                                  # and when switching wired <-> dongle, so we
+                                  # have to notice rather than hold stale fds.
+
 TAP_WINDOW   = 0.28               # s to wait for another tap before resolving
 LONG_PRESS   = 1.2                # s held (no rotation) before it counts as long-press.
                                   # Measured natural hold on this knob is ~1.57s, so this
@@ -646,15 +651,72 @@ def main():
 
     knob = Knob(dry=args.dry_run)
     sel = selectors.DefaultSelector()
+    held = {}                     # path -> device, for everything registered
+    grabbed = set()               # paths we hold EVIOCGRAB on
 
-    for d in grab_devs:
+    def drop(dev, why):
+        """Unregister and close one device.
+
+        Critically this must happen when a device disappears. An unplugged
+        device's fd stays permanently readable (EPOLLHUP), so select() returns
+        it on every pass while read() keeps raising - the old code swallowed
+        that and span the loop at ~20% CPU until restarted.
+        """
         try:
-            d.grab()
-        except Exception as e:
-            print(f"warn: could not grab {d.path}: {e} (run in 'input' group)")
-        sel.register(d, selectors.EVENT_READ)
-    for d in mon_devs:
-        sel.register(d, selectors.EVENT_READ)
+            sel.unregister(dev)
+        except Exception:
+            pass
+        if dev.path in grabbed:
+            try:
+                dev.ungrab()
+            except Exception:
+                pass
+            grabbed.discard(dev.path)
+        try:
+            dev.close()
+        except Exception:
+            pass
+        held.pop(dev.path, None)
+        if why:
+            print(f"device gone: {dev.path} ({why})")
+
+    def rescan(announce=True):
+        """(Re)discover devices and rebuild the selector.
+
+        Needed because the keyboard's nodes are renumbered on every replug and
+        on switching between wired and the dongle. Without this, a transport
+        switch left us grabbing nothing and required a manual restart.
+        """
+        g, m = find_devices()
+        wanted = {d.path: d for d in g}
+        wanted.update({d.path: d for d in m})
+        if set(wanted) == set(held):            # nothing changed - keep the fds
+            for d in list(wanted.values()):
+                d.close()
+            return False
+        for dev in list(held.values()):
+            drop(dev, None)
+        for d in g:
+            try:
+                d.grab()
+                grabbed.add(d.path)
+            except Exception as e:
+                print(f"warn: could not grab {d.path}: {e} (run in 'input' group)")
+            sel.register(d, selectors.EVENT_READ)
+            held[d.path] = d
+        for d in m:
+            sel.register(d, selectors.EVENT_READ)
+            held[d.path] = d
+        if announce:
+            print(f"knobd running on: "
+                  f"{', '.join(d.name for d in g) or 'NOTHING - knob not found'}")
+            print(f"modifiers (shift/ctrl) watched on: "
+                  f"{', '.join(d.name for d in m) or 'nothing'}")
+        return True
+
+    for d in grab_devs + mon_devs:              # discovery above re-runs inside
+        d.close()
+    rescan(announce=False)
 
     # after discovery, so the virtual device is never a discovery candidate
     open_uinput()
@@ -662,11 +724,8 @@ def main():
     check_backlight_access()
 
     def cleanup(*_):
-        for d in grab_devs:
-            try:
-                d.ungrab()
-            except Exception:
-                pass
+        for dev in list(held.values()):
+            drop(dev, None)
         if UI is not None:
             try:
                 UI.close()
@@ -677,19 +736,21 @@ def main():
     signal.signal(signal.SIGTERM, cleanup)
 
     backends = ", ".join(k for k, v in HAVE.items() if v) or "NONE (nothing will happen!)"
-    print(f"knobd running on: {', '.join(d.name for d in grab_devs)}")
+    print(f"knobd running on: "
+          f"{', '.join(d.name for p, d in held.items() if p in grabbed) or 'NOTHING'}")
     print(f"modifiers (shift/ctrl) watched on: "
-          f"{', '.join(d.name for d in mon_devs) or 'nothing'}")
+          f"{', '.join(d.name for p, d in held.items() if p not in grabbed) or 'nothing'}")
     print(f"volume/brightness: {'virtual key -> native GNOME OSD' if UI is not None else 'direct control, NO OSD'}")
     print(f"backends: {backends}")
     if args.dry_run:
         print("DRY RUN - no actions executed. Ctrl-C to quit.")
 
     last_rot = None
+    next_scan = time.monotonic() + RESCAN_EVERY
     while True:
-        # wake for whichever deadline lands first - tap resolution or the
-        # long-press threshold. None blocks until there is input.
-        pending = [d for d in (knob.tap_deadline, knob.long_deadline())
+        # wake for whichever deadline lands first - tap resolution, the
+        # long-press threshold, or the next device rescan.
+        pending = [d for d in (knob.tap_deadline, knob.long_deadline(), next_scan)
                    if d is not None]
         timeout = max(0.0, min(pending) - time.monotonic()) if pending else None
 
@@ -726,12 +787,19 @@ def main():
                         last_rot = now
                     elif code == PRESS_CODE:
                         knob.on_press()
-            except OSError:
-                pass
+            except OSError as e:
+                # unplugged, or the transport was switched. Drop it now - the
+                # fd would otherwise stay readable forever and spin the loop.
+                drop(dev, e.strerror or "read failed")
+                next_scan = time.monotonic()        # look for its replacement
 
         knob.check_long_press()
         if knob.tap_deadline is not None and time.monotonic() >= knob.tap_deadline:
             knob.resolve_taps()
+
+        if time.monotonic() >= next_scan:
+            next_scan = time.monotonic() + RESCAN_EVERY
+            rescan()
 
 if __name__ == "__main__":
     main()
