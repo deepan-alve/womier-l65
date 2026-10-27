@@ -66,26 +66,33 @@ keyboard/dongle once after applying.)
 ## 3. Knob daemon (knobd.py)
 
 Turns the volume knob into a context-aware media/scrub/brightness dial. It **grabs only the knob's
-media node** (so GNOME doesn't double-act) and watches **Left-Shift** read-only (typing untouched).
-It accepts either volume or brightness rotation codes, so it works whether or not the screen-brightness
-firmware patch is flashed.
+media node** (so GNOME doesn't double-act) and watches **Left-Shift / Left-Ctrl / Left-Alt** read-only
+(typing untouched). It accepts either volume or brightness rotation codes, so it works whether or not
+the screen-brightness firmware patch is flashed. It re-scans every few seconds, so it follows the
+keyboard across replugs and wired ↔ dongle switches.
 
-### Gesture map (modifier = Left-Shift)
+### Gesture map (modifiers = Left-Shift / Left-Ctrl / Left-Alt)
 
 | Gesture | Action | If nothing playing |
 |---|---|---|
 | Rotate | Volume ± (accelerates when spun fast) | — |
-| Shift + rotate | Laptop brightness ± | — |
-| Hold + rotate | Scrub / seek | nothing |
+| Shift + rotate | Scrub / seek | nothing |
+| Ctrl + rotate | Laptop brightness ± (native GNOME OSD) | — |
+| Alt + rotate | Assistant trigger, published over MQTT *(only with `--mqtt-host`)* | — |
 | Press once | Play / Pause | Mute |
 | Shift + press once | Mute (always) | — |
 | Double tap | Next track | — |
 | Shift + double tap | Previous track | — |
-| Triple tap | Toggle app profile *(stub — fill later)* | — |
-| Long press | Keyboard profile *(stub — fill later)* | — |
+| Triple tap | Next software profile (`APP_PROFILES`) | — |
+| Long press (1.2 s) | Key lighting: dim dark green ↔ off (`LIGHTING_PRESETS`) | — |
 
-Hold+rotate vs long-press: press down → **rotate while held = scrub** (long-press cancelled); **hold still
-> 0.6 s then release = long press**.
+Scrub is on Shift rather than hold+rotate because the knob's consumer report has a single usage slot:
+rotating while held makes the kernel see a release, so hold+rotate can't be detected.
+
+**Optional MQTT / Home Assistant:** `--mqtt-host HOST [--mqtt-user U --mqtt-password-file F]` publishes
+every gesture as an HA device trigger (needs `pip install paho-mqtt`). Off by default.
+
+`linux/knobprobe.py` dumps raw knob events, which is useful if your unit sends different codes.
 
 ### Run
 
@@ -118,7 +125,7 @@ Edit the constants at the top of `linux/knobd.py`:
 | Constant | Meaning | Default |
 |---|---|---|
 | `TAP_WINDOW` | seconds to wait for another tap | 0.28 |
-| `LONG_PRESS` | seconds held (no rotation) = long press | 0.60 |
+| `LONG_PRESS` | seconds held (no rotation) = long press | 1.2 |
 | `VOL_STEP` / `BRI_STEP` | % per detent | 2 / 2 |
 | `SEEK_STEP` | seconds seek per detent | 3 |
 | `accel_mult(dt)` | spin-speed → step multiplier (×5 / ×3 / ×1) | — |
@@ -163,7 +170,7 @@ python3 linux/l65ctl.py set --knob media                            # or: lighti
 python3 linux/l65ctl.py colors --rgb 8000ff --effect fixed_on --slot 0
 python3 linux/l65ctl.py colors                                      # (no --rgb) print the palette
 
-# remap keys / knob press   (wired + wireless; dongle = layer 0 only)
+# remap keys / knob press   (WIRED only - a dongle write overwrites the Fn layer)
 python3 linux/l65ctl.py remap knob=play_pause caps=esc
 python3 linux/l65ctl.py remap --list                               # all key names + actions
 

@@ -6,17 +6,23 @@ Turns the volume knob into a context-aware media / scrub / brightness dial.
 No keyboard firmware change needed - it just intercepts the knob's evdev events
 and re-dispatches them based on gestures + the Left-Shift modifier.
 
-GESTURE MAP  (Left-Shift = modifier)
+GESTURE MAP  (Left-Shift / Left-Ctrl / Left-Alt = modifiers)
   rotate                -> volume up/down            (accelerates when spun fast)
   Shift + rotate        -> scrub / seek media        (nothing if no player)
-  Ctrl  + rotate        -> laptop screen brightness  (no OSD possible - see bright())
+  Ctrl  + rotate        -> laptop screen brightness  (native OSD, see bright())
+  Alt   + rotate        -> summon the voice assistant (either direction)
+                           Publishes MQTT only; Home Assistant decides what it
+                           does. Debounced to one trigger per ASSIST_COOLDOWN,
+                           since one flick emits several detents.
   press once            -> play/pause  (mute if nothing is playing)
   Shift + press once    -> mute (always)
   double tap            -> next track
   Shift + double tap    -> previous track
   triple tap            -> next software profile     (see APP_PROFILES)
-  long press            -> next lighting preset      (see LIGHTING_PRESETS;
-                           currently DISABLED - notifies only, touches nothing)
+  long press            -> toggle key lighting: dim dark green <-> off
+                           (see LIGHTING_PRESETS). Stand-in for Fn+Space, whose
+                           bright-white mode lives in firmware and never reaches
+                           the host.
 
 Why scrub is on Shift rather than hold+rotate:
   The knob's consumer HID report (id 2) is a SINGLE 16-bit usage slot - mute and
@@ -37,6 +43,7 @@ The user must be able to read AND grab /dev/input/event* (usually: be in the
 
 import os
 import sys
+import json
 import time
 import shutil
 import signal
@@ -87,12 +94,24 @@ LONG_PRESS   = 1.2                # s held (no rotation) before it counts as lon
 VOL_STEP     = 2                  # % volume per detent  - fallback path only
 BRI_STEP     = 2                  # % brightness per detent - fallback path only
 SEEK_STEP    = 3                  # seconds seek per detent (always used - playerctl)
+ASSIST_COOLDOWN = 3.0             # s between Alt+rotate assistant triggers. One
+                                  # flick emits several detents, so a burst must
+                                  # collapse into a single summon.
 
 # Acceleration: gap between detents (s) -> step multiplier. Spin fast = bigger jumps.
+#
+# Deliberately gentle on the uinput path. Each unit here becomes one MORE key
+# event, and every event restarts GNOME's OSD fade animation - at the old 5x a
+# fast spin emitted ~100 events/sec and the slider visibly stuttered, even
+# though the volume itself settles in ~20ms. Spinning faster already yields more
+# detents, so that IS the acceleration; multiplying on top double-counts it.
+# Raise ACCEL_MAX if you want bigger jumps and can live with a busier OSD.
+ACCEL_MAX = 2
+
 def accel_mult(dt):
     if dt is None:   return 1
-    if dt < 0.045:   return 5
-    if dt < 0.090:   return 3
+    if dt < 0.045:   return ACCEL_MAX
+    if dt < 0.090:   return min(2, ACCEL_MAX)
     return 1
 
 SHOW_OSD     = True               # notify-send feedback for discrete actions
@@ -100,21 +119,30 @@ SHOW_OSD     = True               # notify-send feedback for discrete actions
 # --------------------------------------------------------------------------- #
 # Lighting presets - cycled by LONG PRESS
 # --------------------------------------------------------------------------- #
-# Each entry is (name, argv passed to `l65ctl.py set`).
+# Each entry is (name, argv passed to `l65ctl.py`, subcommand first).
 #
-# DISABLED for now - the long press deliberately does not touch the lighting
-# until the RGB/brightness set is decided. Re-enable by moving these back into
-# the list; the cycling machinery in long_press() is unchanged and will pick
-# them straight up:
-#     ("Full",  ["--effect", "neon_stream", "--brightness", "4", "--speed", "4"]),
-#     ("Work",  ["--effect", "fixed_on",    "--brightness", "2", "--color", "white"]),
-#     ("Night", ["--effect", "respire",     "--brightness", "1", "--color", "cyan"]),
-#     ("Dark",  ["--effect", "off"]),
+# Fn+Space on the keyboard toggles a firmware "all white" mode at full RGB
+# FF FF FF. It is handled inside the keyboard (Fn-layer entry 07 00 00 12) and
+# sends nothing to the host, so it cannot be intercepted here. Until the firmware
+# patch in firmware/README.md is flashed, the long press is the dim-green switch.
 #
-# NOTE when re-enabling: `l65ctl.py set` writes the config block to flash
-# (0xC600, 512-byte sector). Fine at long-press frequency, but never wire these
-# to anything that can fire rapidly. The RAM-only path is `l65ctl.py frame`.
-LIGHTING_PRESETS = []
+# Dim green is solid colour (fixed_on) pointed at palette slot 0, which holds a
+# dark RGB rather than green at a low brightness level: level 1 of 4 is still
+# bright, a raw 00 18 00 is not. The palette is set ONCE, out of band:
+#     l65ctl.py colors --rgb 001800 --effect fixed_on --slot 0
+# because it is ~35 radio packets and the keyboard dozes mid-write over the
+# dongle; the toggle below is only the 128-byte config block.
+#
+# NOTE: these write the config block (and the palette) to flash (0xC600, 512-byte
+# sector). Fine at long-press frequency, but never wire them to anything that can
+# fire rapidly. The RAM-only path is `l65ctl.py frame` (wired only).
+#
+# The first long press after the daemon starts moves to index 1, so dim green
+# comes first and off second.
+LIGHTING_PRESETS = [
+    ("Keys off",  ["set", "--effect", "off"]),
+    ("Dim green", ["set", "--effect", "fixed_on", "--color", "0", "--brightness", "4"]),
+]
 
 # --------------------------------------------------------------------------- #
 # Software profiles - cycled by TRIPLE TAP
@@ -302,16 +330,26 @@ def backlight_files():
     return sorted(glob.glob("/sys/class/backlight/*/brightness"))
 
 
-def bright(delta_pct, up, taps=1):
-    """Set screen brightness directly. The virtual key CANNOT be used here.
+BRIGHT_BINDING = "<Ctrl>XF86MonBrightnessUp"
+BRIGHT_GSETTING = ("org.gnome.shell.keybindings", "screen-brightness-up")
 
-    Measured on this machine: GNOME ignores KEY_BRIGHTNESSUP/DOWN whenever any
-    modifier is held - Shift and Ctrl both block it. Unlike mute there is no way
-    to teach it otherwise: the media-keys schema exposes keyboard-backlight
-    bindings only, not screen brightness. Since this action is reachable only
-    with Ctrl down, a synthetic key would always be swallowed. That also means
-    no native OSD is possible, so we report the level ourselves.
+
+def bright(delta_pct, up, taps=1):
+    """Raise/lower screen brightness, preferring the real key for the OSD.
+
+    Screen brightness is bound in org.gnome.shell.keybindings (NOT media-keys,
+    which only covers the keyboard backlight). Out of the box the bare key works
+    and Ctrl is unbound, so a synthetic Ctrl+key did nothing at all - and Shift
+    is already taken by screen-brightness-up-monitor, per-monitor adjustment,
+    which is a no-op on a single-display laptop. Adding the Ctrl variant to that
+    binding list makes GNOME handle it and draw its own OSD; see
+    check_brightness_binding(), which says so at startup if it is missing.
+
+    The direct sysfs path below is only a fallback for when uinput is absent.
     """
+    if UI is not None:
+        tap(ecodes.KEY_BRIGHTNESSUP if up else ecodes.KEY_BRIGHTNESSDOWN, taps)
+        return
     files = backlight_files()
     if not files:
         return
@@ -345,8 +383,26 @@ def bright(delta_pct, up, taps=1):
     notify(f"{round(new * 100 / mx)}%", "Brightness")
 
 
+def check_brightness_binding():
+    """Warn if ctrl+rotate will silently fail to change brightness."""
+    schema, key = BRIGHT_GSETTING
+    r = run(["gsettings", "get", schema, key])
+    if r is None or r.returncode != 0:
+        return
+    if BRIGHT_BINDING not in r.stdout:
+        print(f"warn: GNOME has no '{BRIGHT_BINDING}' binding, so ctrl+rotate "
+              f"will not\n      change brightness. fix:\n"
+              f"        gsettings set {schema} {key} "
+              f"\"['XF86MonBrightnessUp', '{BRIGHT_BINDING}']\"\n"
+              f"        gsettings set {schema} screen-brightness-down "
+              f"\"['XF86MonBrightnessDown', '<Ctrl>XF86MonBrightnessDown']\"")
+
+
 def check_backlight_access():
-    """Warn at startup if ctrl+rotate will not be able to move the backlight."""
+    """Warn if the sysfs FALLBACK cannot write. Irrelevant when uinput works,
+    since then GNOME owns the backlight and we never touch sysfs."""
+    if UI is not None:
+        return
     files = backlight_files()
     if not files:
         return
@@ -402,13 +458,92 @@ def l65ctl(args, label):
     threading.Thread(target=work, daemon=True).start()
 
 # --------------------------------------------------------------------------- #
+# MQTT - publishes gestures for Home Assistant
+# --------------------------------------------------------------------------- #
+class MqttPublisher:
+    """Publishes knob gestures to MQTT for Home Assistant.
+
+    Also emits an MQTT *device trigger* discovery message so the gesture shows
+    up natively in HA's automation UI ("when Womier L65 knob -> alt_rotate")
+    rather than forcing a hand-written MQTT trigger.
+    """
+
+    def __init__(self, host, port, username, password, node="l65",
+                 discovery_prefix="homeassistant"):
+        import paho.mqtt.client as mqtt
+        self.mqtt = mqtt
+        self.node = node
+        self.topic = f"knobd/{node}/event"
+        self.discovery_prefix = discovery_prefix.rstrip("/")
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                  client_id=f"knobd-{node}")
+        if username:
+            self.client.username_pw_set(username, password)
+        self.client.on_connect = self._on_connect
+        self.client.connect_async(host, port, keepalive=60)
+        self.client.loop_start()
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code != 0:
+            print(f"[mqtt] connect failed: {reason_code}", file=sys.stderr, flush=True)
+            return
+        print("[mqtt] connected", flush=True)
+        device = {
+            "identifiers": [f"knobd_{self.node}"],
+            "name": "Womier L65 knob",
+            "manufacturer": "Womier",
+            "model": "L65",
+        }
+        for subtype in ("alt_rotate",):
+            cfg = {
+                "automation_type": "trigger",
+                "type": "action",
+                "subtype": subtype,
+                "topic": self.topic,
+                "payload": subtype,
+                "value_template": "{{ value_json.gesture }}",
+                "device": device,
+            }
+            client.publish(f"{self.discovery_prefix}/device_automation/"
+                           f"knobd_{self.node}/{subtype}/config",
+                           json.dumps(cfg), retain=True, qos=1)
+
+    def publish_event(self, gesture, direction=None):
+        payload = {"gesture": gesture}
+        if direction:
+            payload["direction"] = direction
+        try:
+            info = self.client.publish(self.topic, json.dumps(payload), qos=1)
+            # publish() does NOT raise when the client is offline - it returns
+            # rc=MQTT_ERR_NO_CONN and quietly queues. Log the rc so a failure is
+            # visible in the journal instead of looking like nothing happened.
+            ok = info.rc == self.mqtt.MQTT_ERR_SUCCESS
+            print(f"[mqtt] publish {gesture}"
+                  f"{'/' + direction if direction else ''} "
+                  f"rc={info.rc} ({'ok' if ok else 'NOT CONNECTED'})",
+                  flush=True)
+        except Exception as e:
+            print(f"[mqtt] publish failed: {e}", file=sys.stderr, flush=True)
+
+    def stop(self):
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Gesture engine
 # --------------------------------------------------------------------------- #
 class Knob:
-    def __init__(self, dry=False):
+    def __init__(self, dry=False, publisher=None):
         self.dry          = dry
+        self.publisher    = publisher  # MqttPublisher or None
         self.shift        = False   # Left-Shift held?
         self.ctrl         = False   # Left-Ctrl held?
+        self.alt          = False   # Left-Alt held?
+        self.assist_t     = 0.0     # monotonic time of the last assistant trigger
         self.press_t      = None    # monotonic time knob went down, or None
         self.rotated      = False   # did a rotation happen during this press?
         self.long_fired   = False   # long press already fired for this hold?
@@ -438,7 +573,11 @@ class Knob:
             # firmware ever delivers both, a long press must not also fire.
             self.flush_taps()
             self.rotated = True
-        if self.shift:                               # shift + rotate = scrub / seek
+        if self.alt:                                 # alt + rotate = summon assistant
+            # Checked before the others: holding Alt is deliberate, so it wins
+            # over an accidentally-held Shift or Ctrl.
+            self.assist(up)
+        elif self.shift:                             # shift + rotate = scrub / seek
             # active_player() is cached; media_status() would spawn a subprocess
             # on every single detent, which is far too slow to scrub with
             if active_player() is not None:
@@ -453,6 +592,30 @@ class Knob:
             step = self.tune('vol_step', VOL_STEP) * m
             self.act(f"volume {'+' if up else '-'}{step}% ({m} tap)",
                      lambda: vol(step, up, m))
+
+    # -- assistant --------------------------------------------------------- #
+    def assist(self, up):
+        """Alt + rotate: ask Home Assistant to summon the voice assistant.
+
+        Deliberately does nothing locally - the knob is an input device, and
+        what "summon the assistant" means belongs in an HA automation where it
+        can change without touching this daemon.
+
+        One flick of the knob emits several detents, so this collapses a burst
+        into a single trigger. Direction is reported but both directions mean
+        the same thing.
+        """
+        now = time.monotonic()
+        if now - self.assist_t < ASSIST_COOLDOWN:
+            return
+        self.assist_t = now
+        direction = "up" if up else "down"
+        if self.dry:
+            print(f"[dry] assistant trigger (alt+rotate {direction})")
+            return
+        notify("summoning", "Assistant")
+        if self.publisher:
+            self.publisher.publish_event("alt_rotate", direction)
 
     # -- press / release --------------------------------------------------- #
     def on_press(self):
@@ -541,7 +704,7 @@ class Knob:
 
         def apply():
             notify(name, "Lighting")
-            l65ctl(["set"] + argv, f"preset {name}")
+            l65ctl(argv, f"preset {name}")
 
         self.act(f"lighting preset {name} ({' '.join(argv)})", apply)
 
@@ -581,7 +744,8 @@ def find_devices():
         if (d.info.vendor in VENDORS
                 and ((ROTATE_UP | ROTATE_DOWN) & caps) and not is_typing_kbd):
             grab.append(d)          # the knob itself - only ever an L65 consumer node
-        elif ecodes.KEY_LEFTSHIFT in caps or ecodes.KEY_LEFTCTRL in caps:
+        elif (ecodes.KEY_LEFTSHIFT in caps or ecodes.KEY_LEFTCTRL in caps
+                or ecodes.KEY_LEFTALT in caps):
             mon.append(d)           # ANY keyboard, read only, purely for modifiers
         else:
             d.close()
@@ -628,6 +792,15 @@ def main():
     ap.add_argument("--list", action="store_true", help="list detected devices and exit")
     ap.add_argument("--dry-run", action="store_true", help="log gestures, execute nothing")
     ap.add_argument("--help-setup", action="store_true", help="print install/setup notes")
+    g = ap.add_argument_group("MQTT / Home Assistant")
+    g.add_argument("--mqtt-host", help="broker host; enables gesture publishing")
+    g.add_argument("--mqtt-port", type=int, default=1883)
+    g.add_argument("--mqtt-user")
+    g.add_argument("--mqtt-password-file", metavar="PATH",
+                   help="file holding the password, or username on line 1 and "
+                        "password on line 2 (keeps it out of the process list)")
+    g.add_argument("--mqtt-node", default="l65",
+                   help="node id used in topics and the HA device (default: l65)")
     args = ap.parse_args()
 
     if args.help_setup:
@@ -649,7 +822,24 @@ def main():
         sys.exit("No L65 knob device found (needs VOLUMEUP+MUTE). "
                  "Run 'python3 knobd.py --list'.")
 
-    knob = Knob(dry=args.dry_run)
+    publisher = None
+    if args.mqtt_host:
+        password, user = None, args.mqtt_user
+        if args.mqtt_password_file:
+            with open(os.path.expanduser(args.mqtt_password_file)) as fh:
+                lines = [l.strip() for l in fh if l.strip()]
+            if len(lines) >= 2 and not user:
+                user, password = lines[0], lines[1]
+            else:
+                password = lines[-1] if lines else None
+        try:
+            publisher = MqttPublisher(args.mqtt_host, args.mqtt_port, user,
+                                      password, node=args.mqtt_node)
+        except ImportError:
+            sys.exit("paho-mqtt not installed. "
+                     "Install: sudo apt install python3-paho-mqtt")
+
+    knob = Knob(dry=args.dry_run, publisher=publisher)
     sel = selectors.DefaultSelector()
     held = {}                     # path -> device, for everything registered
     grabbed = set()               # paths we hold EVIOCGRAB on
@@ -721,6 +911,7 @@ def main():
     # after discovery, so the virtual device is never a discovery candidate
     open_uinput()
     check_mute_binding()
+    check_brightness_binding()
     check_backlight_access()
 
     def cleanup(*_):
@@ -769,6 +960,10 @@ def main():
                     if code == ecodes.KEY_LEFTCTRL:
                         if val in (0, 1):
                             knob.ctrl = (val == 1)
+                        continue
+                    if code == ecodes.KEY_LEFTALT:
+                        if val in (0, 1):
+                            knob.alt = (val == 1)
                         continue
 
                     # act on key-down (val==1); handle knob release separately

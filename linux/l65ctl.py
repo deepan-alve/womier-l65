@@ -13,7 +13,7 @@ Capability by transport (what the dongle physically relays is the difference):
   effect/brightness/speed  y        y      (config block)
   side strip, tap/sleep/... y        y
   custom colours (palette)  y        y
-  key / knob remap          y        y
+  key / knob remap          y        -      (dongle write lands on the Fn layer - refused, see cmd_remap)
   per-key colours (each key) y       -      (378-byte Self-define block; dongle has no per-key payload)
   macros                    y        -
   realtime frame / music    y        -
@@ -23,7 +23,7 @@ Usage:
   l65ctl.py effects
   l65ctl.py set --effect respire --brightness 2 --speed 0 --color red
   l65ctl.py colors --rgb 8000ff [--effect fixed_on] [--slot 0]     # custom colour (wired or wireless)
-  l65ctl.py remap knob=play_pause caps=esc [--layer 0]             # keys/knob (wired or wireless)
+  l65ctl.py remap knob=play_pause caps=esc [--layer 0]             # keys/knob (WIRED only)
   l65ctl.py keys --all blue w=red a=red s=red d=red                # per-key colours (WIRED only)
   l65ctl.py frame --all 8000ff --seconds 3                         # realtime (WIRED only)
   l65ctl.py battery                                                # (WIRELESS)
@@ -309,7 +309,11 @@ class WirelessTransport:
             if r is None:
                 break
             if (r[1] & 0x7F) == 0x4A:
-                return r[5], bool(r[6])
+                # byte 5 = level %, byte 6 = status FLAGS (not a charging bool).
+                # Measured on a full, unplugged keyboard: 64 10 -> 100%, 0x10.
+                # bool(byte6) therefore reported "charging" while discharging;
+                # return the raw byte until the bit meanings are actually decoded.
+                return r[5], r[6]
         raise NotSupported('no battery response (asleep? press a key)')
 
     def frame(self, data):
@@ -450,8 +454,9 @@ def cmd_dump(dev, a):
 
 
 def cmd_battery(dev, a):
-    lvl, charging = dev.battery()
-    print(f'battery {lvl}%  ({"charging" if charging else "discharging"})')
+    lvl, status = dev.battery()
+    bits = ' '.join(f'bit{i}' for i in range(8) if status >> i & 1) or 'none'
+    print(f'battery {lvl}%  (status 0x{status:02x}, {bits} set)')
 
 
 def cmd_set(dev, a):
@@ -550,8 +555,12 @@ def cmd_remap(dev, a):
         return
     if not a.assign:
         sys.exit('pass KEY=ACTION pairs, e.g. knob=play_pause caps=esc')
-    if dev.name != 'wired' and a.layer != 0:
-        sys.exit('over the dongle only layer 0 (default layer) is confirmed; use wired for FN1/FN2/Tap layers')
+    if dev.name != 'wired':
+        # The dongle READS the base layer but its matrix WRITE lands on flash layer 1,
+        # the Fn layer: a remap over 2.4G on 2026-09-28 wiped every Fn combo
+        # (Fn+Space, Fn+\, Fn+Tab...). Wired index 0 = base, 1 = Fn. Until the
+        # dongle's addressing is understood, key-matrix writes are wired-only.
+        sys.exit('remap over the 2.4G dongle overwrites the Fn layer; flip to wired and use the cable')
     layer = bytearray(dev.read('matrix', index=a.layer))
     cfg = read_cfg(dev)
     print(f'backups {backup(layer, f"matrix{a.layer}")}, {backup(cfg, "cfg")}')
@@ -596,6 +605,8 @@ def cmd_restore(dev, a):
     elif len(saved) in (WIRED_PALETTE_LEN, WL_PALETTE_LEN):
         dev.write('palette', saved)
     elif len(saved) == MATRIX_LEN:
+        if dev.name != 'wired':
+            sys.exit('key-matrix restore is wired-only (dongle writes land on the Fn layer)')
         m = re.search(r'matrix(\d)', os.path.basename(a.file))
         dev.write('matrix', saved, index=int(m.group(1)) if m else 0)
         dev.write('config', bytes(read_cfg(dev)))
@@ -644,7 +655,7 @@ def main():
     sp.add_argument('--list', action='store_true')
     sp.set_defaults(func=cmd_keys)
 
-    sp = sub.add_parser('remap', help='remap keys / knob press (wired+wireless)')
+    sp = sub.add_parser('remap', help='remap keys / knob press (WIRED only)')
     sp.add_argument('assign', nargs='*', type=remap_arg, metavar='KEY=ACTION')
     sp.add_argument('--layer', type=ranged(0, 3), default=0)
     sp.add_argument('--list', action='store_true')

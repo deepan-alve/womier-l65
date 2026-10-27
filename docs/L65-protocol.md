@@ -90,6 +90,14 @@ LED/key slot = column × 6 + row (see `KEY_SLOTS` in `l65ctl.py`). Entry `[type,
 
 Swapping two entries on layer 0 and committing with a config write took effect immediately ✅.
 
+**Dongle matrix writes hit the Fn layer** ❌ (2026-09-28). Over the cable, matrix index 0 is the
+base layer and index 1 is the **Fn layer** (factory image `0xCC00` and `0xD000`; wired reads of both
+match the image byte-for-byte). Over the dongle, a matrix *read* returns the base layer for every
+index, but a matrix *write* (`0x01`) lands on flash layer 1: a Caps remap sent over 2.4G replaced
+the whole Fn layer with a copy of the base keys, so every Fn combo typed its plain key. Restored
+by writing the factory image's `0xD000..+504` back to wired index 1. Indices 2-7 read empty.
+`l65ctl.py` now refuses key-matrix writes over the dongle.
+
 ## Music mode (host side)
 
 The keyboard has no audio input. The app records the PC's output (WASAPI loopback), runs an FFT,
