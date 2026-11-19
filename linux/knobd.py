@@ -33,9 +33,10 @@ Why scrub is on Shift rather than hold+rotate:
 REQUIRES
   python-evdev                         (pip install evdev  /  distro python3-evdev)
   wpctl (PipeWire) OR pactl OR amixer  -> volume
-  playerctl                            -> media control + scrub
+  python3-gi (PyGObject)               -> media control, scrub and banners over
+                                          session D-Bus (MPRIS + notifications)
+  playerctl, notify-send               -> fallback only, when python3-gi is missing
   brightnessctl                        -> laptop backlight
-  notify-send                          -> on-screen feedback (optional)
 
 The user must be able to read AND grab /dev/input/event* (usually: be in the
 'input' group, then re-login). See the setup notes printed by `--help-setup`.
@@ -49,6 +50,7 @@ import shutil
 import signal
 import argparse
 import selectors
+import queue
 import threading
 import subprocess
 from pathlib import Path
@@ -77,7 +79,7 @@ RESCAN_EVERY = 3.0                # s between device re-scans. The keyboard's
                                   # and when switching wired <-> dongle, so we
                                   # have to notice rather than hold stale fds.
 
-TAP_WINDOW   = 0.28               # s to wait for another tap before resolving
+TAP_WINDOW   = 0.40               # s to wait for another tap before resolving
 LONG_PRESS   = 1.2                # s held (no rotation) before it counts as long-press.
                                   # Measured natural hold on this knob is ~1.57s, so this
                                   # sits just under it: deliberate enough not to trigger by
@@ -203,6 +205,19 @@ def tap(code, times=1):
         UI.write(ecodes.EV_KEY, code, 0)
         UI.syn()
 
+JOBS = queue.Queue()
+
+def _worker():
+    while True:
+        fn = JOBS.get()
+        try:
+            fn()
+        except Exception as e:
+            print(f"action failed: {e!r}")
+
+threading.Thread(target=_worker, name="knobd-actions", daemon=True).start()
+
+
 def run(cmd, timeout=2):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -266,37 +281,74 @@ _player = None                    # last player we chose, for stickiness
 _player_at = 0.0                  # when we last looked (monotonic)
 PLAYER_TTL = 1.0                  # s to reuse the choice before re-scanning
 
+# --------------------------------------------------------------------------- #
+# Session D-Bus: MPRIS players + desktop notifications, with no subprocesses.
+# The old path forked `playerctl` 2-4 times per gesture (~30-80 ms each) and
+# `notify-send` once more. One persistent connection does the same in ~1 ms.
+# Falls back to the CLI tools if PyGObject is missing.
+# --------------------------------------------------------------------------- #
+try:
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    BUS = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+except Exception as _e:
+    BUS = None
+    print(f"warn: no D-Bus via PyGObject ({_e}) - falling back to playerctl/notify-send")
+
+MPRIS      = "org.mpris.MediaPlayer2"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+PLAYER_IF  = MPRIS + ".Player"
+
+
+def _dbus(name, path, iface, method, args=None, timeout=800):
+    try:
+        return BUS.call_sync(name, path, iface, method, args, None,
+                             Gio.DBusCallFlags.NONE, timeout, None).unpack()
+    except Exception:
+        return None
+
+
+def _prop(player, prop, iface=PLAYER_IF):
+    r = _dbus(player, MPRIS_PATH, "org.freedesktop.DBus.Properties", "Get",
+              GLib.Variant("(ss)", (iface, prop)))
+    return r[0] if r else None
+
+
+def _player_names():
+    if BUS is None:
+        r = run(["playerctl", "-l"]) if HAVE["playerctl"] else None
+        return r.stdout.split() if (r and r.returncode == 0) else []
+    r = _dbus("org.freedesktop.DBus", "/org/freedesktop/DBus",
+              "org.freedesktop.DBus", "ListNames")
+    return [n for n in (r[0] if r else []) if n.startswith(MPRIS + ".")]
+
+
+def _status(player):
+    if BUS is None:
+        r = run(["playerctl", "-p", player, "status"])
+        return r.stdout.strip() if (r and r.returncode == 0) else None
+    return _prop(player, "PlaybackStatus")
+
 
 def active_player(force=False):
     """Name of the MPRIS player to control, or None.
 
-    A bare `playerctl` command targets the FIRST player on the bus, not the one
-    you are actually listening to. With VLC playing and a paused YouTube tab in
-    Chromium, every command went to Chromium and VLC ignored the knob entirely.
-
-    So: prefer whatever is genuinely Playing. The choice is sticky, so pausing
-    does not immediately hand control to some other player, and it is cached for
-    PLAYER_TTL because this costs one subprocess per player and gets called on
-    every detent while scrubbing.
-
-    (playerctld would also solve this, but it is another daemon to run and it
-    tracks last-active rather than actually-playing.)
+    Prefers whatever is genuinely Playing, not the first player on the bus
+    (with VLC playing and a paused YouTube tab, a bare `playerctl` hit the tab).
+    The choice is sticky, so pausing does not hand control to another player,
+    and cached for PLAYER_TTL because scrubbing calls this on every detent.
     """
     global _player, _player_at
-    if not HAVE["playerctl"]:
-        return None
     now = time.monotonic()
     if not force and (now - _player_at) < PLAYER_TTL:
         return _player
     _player_at = now
-    r = run(["playerctl", "-l"])
-    names = r.stdout.split() if (r and r.returncode == 0) else []
+    names = _player_names()
     if not names:
         _player = None
         return None
-    playing = [n for n in names
-               if (s := run(["playerctl", "-p", n, "status"]))
-               and s.returncode == 0 and s.stdout.strip() == "Playing"]
+    playing = [n for n in names if _status(n) == "Playing"]
     if playing:
         _player = _player if _player in playing else playing[0]
     elif _player not in names:
@@ -307,23 +359,95 @@ def active_player(force=False):
 def media_status():
     """Return 'Playing'/'Paused'/'Stopped' for the active player, else None."""
     p = active_player()
-    if p is None:
-        return None
-    r = run(["playerctl", "-p", p, "status"])
-    if not r or r.returncode != 0:
-        return None
-    return r.stdout.strip()
+    return _status(p) if p else None
+
+
+def track(player):
+    """(title, artist, local art path or None) for a player."""
+    if BUS is None:
+        r = run(["playerctl", "-p", player, "metadata", "--format",
+                 "{{title}}\t{{artist}}\t{{mpris:artUrl}}"])
+        parts = (r.stdout.rstrip("\n").split("\t") + ["", "", ""])[:3] if r else ["", "", ""]
+        title, artist, art = parts
+    else:
+        md = _prop(player, "Metadata") or {}
+        title = md.get("xesam:title") or ""
+        artist = md.get("xesam:artist") or ""
+        if isinstance(artist, (list, tuple)):
+            artist = ", ".join(artist)
+        art = md.get("mpris:artUrl") or ""
+    art = art[7:] if art.startswith("file://") else None
+    return title.strip(), artist.strip(), (art if art and os.path.isfile(art) else None)
+
+
+def player_label(player):
+    """Human name of a player, e.g. 'Chromium' or 'Spotify'."""
+    name = _prop(player, "Identity", MPRIS) if BUS is not None else None
+    return name or player.split(".")[-2 if ".instance" in player else -1].capitalize()
+
+
+_CMD = {"play-pause": "PlayPause", "next": "Next", "previous": "Previous"}
 
 def media(cmd):
     p = active_player()
-    if p:
+    if not p:
+        return None
+    if BUS is None:
         run(["playerctl", "-p", p, cmd])
-        active_player(force=True)      # the action may have changed who is playing
+    else:
+        _dbus(p, MPRIS_PATH, PLAYER_IF, _CMD[cmd])
+    active_player(force=True)      # the action may have changed who is playing
+    return p
+
 
 def scrub(seconds, forward):
     p = active_player()
-    if p:
+    if not p:
+        return
+    if BUS is None:
         run(["playerctl", "-p", p, "position", f"{seconds}{'+' if forward else '-'}"])
+    else:
+        us = int(seconds * 1_000_000) * (1 if forward else -1)
+        _dbus(p, MPRIS_PATH, PLAYER_IF, "Seek", GLib.Variant("(x)", (us,)))
+
+
+def play_pause_or_mute():
+    """Single tap: play/pause the active player, or mute if there is none."""
+    p = active_player()
+    before = _status(p) if p else None
+    if before is None:
+        mute_toggle()
+        return
+    media("play-pause")
+    title, artist, art = track(p)
+    paused = before == "Playing"
+    notify(artist or player_label(p), title or ("Paused" if paused else "Playing"),
+           icon="media-playback-pause-symbolic" if paused else "media-playback-start-symbolic",
+           image=art)
+
+
+def skip(forward):
+    """Double tap: next / previous track, then show what is now playing.
+
+    Players update their metadata a moment after Next/Previous returns, so wait
+    for the title to change (up to ~0.8 s) before announcing it.
+    """
+    p = active_player()
+    if not p:
+        notify("Nothing is playing", "Knob", icon="audio-x-generic-symbolic")
+        return
+    old = track(p)[0]
+    media("next" if forward else "previous")
+    title, artist, art = old, "", None
+    for _ in range(16):
+        time.sleep(0.05)
+        title, artist, art = track(p)
+        if title and title != old:
+            break
+    notify(artist or player_label(p), title or ("Next" if forward else "Previous"),
+           icon="media-skip-forward-symbolic" if forward else "media-skip-backward-symbolic",
+           image=art)
+
 
 def backlight_files():
     import glob
@@ -417,11 +541,37 @@ def check_backlight_access():
           f"a re-login is not enough).\n      udev cannot help: uaccess only ACLs "
           f"/dev nodes, and a backlight has none.")
 
-def notify(msg, title="Knob"):
-    if SHOW_OSD and HAVE["notify-send"]:
-        # the synchronous hint makes each OSD replace the previous one instead of stacking
-        run(["notify-send", "-t", "1200",
-             "-h", "string:x-canonical-private-synchronous:knobd", title, msg])
+_notify_id = 0
+_notify_lock = threading.Lock()
+
+def notify(msg, title="Knob", icon="input-keyboard-symbolic", image=None):
+    """Short-lived banner that replaces the previous one in place.
+
+    transient = GNOME shows it but never files it in the notification list, so
+    a session of knob use leaves nothing behind. replaces_id = a new banner
+    swaps the old one instead of queueing behind it. (The old
+    x-canonical-private-synchronous hint did neither: GNOME ignores it.)
+    """
+    global _notify_id
+    if not SHOW_OSD:
+        return
+    if BUS is None:
+        if HAVE["notify-send"]:
+            run(["notify-send", "-e", "-u", "low", "-a", "Knob", "-i", image or icon,
+                 "-t", "1500", title, msg])
+        return
+    hints = {"transient": GLib.Variant("b", True),
+             "urgency": GLib.Variant("y", 0),
+             "desktop-entry": GLib.Variant("s", "knobd")}
+    if image:
+        hints["image-path"] = GLib.Variant("s", image)
+    with _notify_lock:
+        r = _dbus("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                  "org.freedesktop.Notifications", "Notify",
+                  GLib.Variant("(susssasa{sv}i)",
+                               ("Knob", _notify_id, icon, title, msg, [], hints, 1500)))
+        if r:
+            _notify_id = r[0]
 
 def find_l65ctl():
     """Absolute path to l65ctl.py, or None.
@@ -553,11 +703,23 @@ class Knob:
         self.profile_i    = 0       # index into APP_PROFILES
         self.preset_i     = 0       # index into LIGHTING_PRESETS
 
-    def act(self, desc, fn):
+    def act(self, desc, fn, slow=False, log=True):
+        """Run one gesture's action.
+
+        slow=True queues it on the worker thread (D-Bus calls, waiting for track
+        metadata), so knob input keeps flowing meanwhile. Volume and brightness
+        are a few microseconds of uinput and stay inline. One worker, so actions
+        still run in the order they were made.
+        """
         if self.dry:
             print(f"[dry] {desc}")
             return
-        fn()
+        if log:
+            print(f"gesture: {desc}")
+        if slow:
+            JOBS.put(fn)
+        else:
+            fn()
 
     def tune(self, key, default):
         """Step size for the active software profile, else the global default."""
@@ -583,15 +745,15 @@ class Knob:
             if active_player() is not None:
                 step = self.tune('seek_step', SEEK_STEP) * m
                 self.act(f"scrub {'+' if up else '-'}{step}s",
-                         lambda: scrub(step, up))
+                         lambda: scrub(step, up), slow=True, log=False)
         elif self.ctrl:                              # ctrl + rotate = brightness
             step = self.tune('bri_step', BRI_STEP) * m
             self.act(f"brightness {'+' if up else '-'}{step}%",
-                     lambda: bright(step, up, m))
+                     lambda: bright(step, up, m), log=False)
         else:                                        # plain rotate = volume
             step = self.tune('vol_step', VOL_STEP) * m
             self.act(f"volume {'+' if up else '-'}{step}% ({m} tap)",
-                     lambda: vol(step, up, m))
+                     lambda: vol(step, up, m), log=False)
 
     # -- assistant --------------------------------------------------------- #
     def assist(self, up):
@@ -668,15 +830,11 @@ class Knob:
         if n == 1:
             if shift:
                 self.act("mute", mute_toggle)
-            elif media_status():
-                self.act("play/pause", lambda: media("play-pause"))
             else:
-                self.act("mute (no media)", mute_toggle)
+                self.act("play/pause", play_pause_or_mute, slow=True)
         elif n == 2:
-            if shift:
-                self.act("previous", lambda: (media("previous"), notify("Previous")))
-            else:
-                self.act("next", lambda: (media("next"), notify("Next")))
+            self.act("previous" if shift else "next",
+                     lambda: skip(not shift), slow=True)
         elif n >= 3:
             self.toggle_app_profile()
 
@@ -697,7 +855,7 @@ class Knob:
             # deliberately unassigned - still report it, so the gesture is
             # visibly firing and we know the threshold is right
             self.act("long press (lighting disabled)",
-                     lambda: notify("Long press — nothing assigned", "Knob"))
+                     lambda: notify("Nothing assigned", "Long press"))
             return
         self.preset_i = (self.preset_i + 1) % len(LIGHTING_PRESETS)
         name, argv = LIGHTING_PRESETS[self.preset_i]
@@ -819,8 +977,9 @@ def main():
         return
 
     if not grab_devs:
-        sys.exit("No L65 knob device found (needs VOLUMEUP+MUTE). "
-                 "Run 'python3 knobd.py --list'.")
+        # Do not exit: the dongle may be plugged in later. The rescan in the
+        # main loop picks the knob up within RESCAN_EVERY seconds.
+        print("No L65 knob device found yet - waiting for it to appear.")
 
     publisher = None
     if args.mqtt_host:

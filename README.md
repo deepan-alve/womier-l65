@@ -35,7 +35,7 @@ lighting/remap, firmware flashing, factory reset, troubleshooting.
 ## Quick start on Linux
 
 ```bash
-sudo apt install python3-evdev playerctl brightnessctl   # deps for the knob daemon
+sudo apt install python3-evdev python3-gi brightnessctl   # deps for the knob daemon
 sudo cp udev/60-womier-l65.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger
 sudo usermod -aG input $USER                             # then log out/in

@@ -26,14 +26,14 @@ cd womier-l65
 Install dependencies (Debian/Ubuntu; adjust for your distro):
 
 ```bash
-sudo apt install python3-evdev playerctl brightnessctl
+sudo apt install python3-evdev python3-gi brightnessctl
 ```
 
 - `python3-evdev` — knob daemon (can also `pip install --user evdev`)
-- `playerctl` — media control + scrub
+- `python3-gi`: media control, scrub and banners over D-Bus (`playerctl` is the fallback)
 - `brightnessctl` — laptop backlight
 - `wpctl` (PipeWire) is usually already present; else install `wireplumber`. `pactl`/`amixer` also work.
-- `notify-send` (usually preinstalled) — on-screen feedback
+- `notify-send`: fallback for banners when `python3-gi` is missing
 
 `l65ctl.py` needs **no** Python packages — pure `hidraw`. `numpy` is optional and not required.
 
@@ -253,7 +253,7 @@ re-import `firmware/l65-full.bin` into Ghidra (the project DB isn't in the repo,
 | knob press does nothing in `--dry-run` | Press isn't `KEY_MUTE` — note the code shown and set `PRESS_CODE` in `knobd.py`. |
 | rotate does nothing | Check backend line on startup — need one of `wpctl`/`pactl`/`amixer`. |
 | brightness doesn't change | `brightnessctl` installed? Laptop panel only (external monitors need `ddcutil`, not wired here). |
-| next/prev/play do nothing | `playerctl` installed and an MPRIS player running? |
+| next/prev/play do nothing | An MPRIS player running? Check `journalctl --user -u knobd -f` for `gesture:` lines. |
 | GNOME still changes volume too | The daemon didn't grab the device — run in the `input` group so `EVIOCGRAB` succeeds. |
 | `l65ctl` "permission denied" | Install the udev rule (section 2b), re-plug. |
 | `l65ctl --wireless` "asleep" | Press a key to wake the keyboard, retry. |
