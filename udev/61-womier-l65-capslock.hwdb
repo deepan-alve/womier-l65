@@ -1,0 +1,12 @@
+# Womier L65: Caps Lock does nothing.
+# Matches only the L65 (wired 258a:010c and its 2.4G dongle 3554:fa09), so a
+# laptop or other keyboard keeps its Caps Lock.
+# 70039 is the HID usage of Caps Lock (page 0x07, usage 0x39).
+# Install:
+#   sudo cp udev/61-womier-l65-capslock.hwdb /etc/udev/hwdb.d/
+#   sudo systemd-hwdb update && sudo udevadm trigger -s input
+# Undo: delete the file and run the same two commands.
+
+evdev:input:b0003v258Ap010C*
+evdev:input:b0003v3554pFA09*
+ KEYBOARD_KEY_70039=reserved
